@@ -1,0 +1,25 @@
+# requirements-edge.txt
+# Raspberry Pi 3B (64bit Lite OS) / Python 3.11+
+# sudo apt install python3-dev portaudio19-dev libatlas-base-dev
+
+# 通信
+websockets==12.0
+
+# データバリデーション
+pydantic==2.7.1
+pyyaml==6.0.1
+python-dotenv==1.0.1
+
+# 音声
+pyaudio==0.2.14          # portaudio バインディング
+vosk==0.3.45             # ウェイクワード検知
+numpy==1.26.4
+
+# ハードウェア制御 (Pi専用)
+adafruit-circuitpython-pca9685==3.4.13
+adafruit-circuitpython-motor==3.4.12
+RPi.GPIO==0.7.1
+picamera2==0.3.18         # Pi Camera v2/v3
+
+# ユーティリティ
+psutil==5.9.8
