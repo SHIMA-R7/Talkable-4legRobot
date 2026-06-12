@@ -48,7 +48,7 @@ class ControlChannel:
 
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and not self._ws.closed
+        return self._ws is not None and not self._ws.close_code
 
     async def start(self) -> None:
         """バックグラウンドで接続ループを開始する"""
