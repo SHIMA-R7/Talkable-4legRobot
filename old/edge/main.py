@@ -1,16 +1,5 @@
 """
-edge/main.py  (Stage 3 統合版)
-==============================
-エッジ (Raspberry Pi) のエントリーポイント。
-
-起動順序:
-  1. 設定ロード・ログ初期化
-  2. WebSocket接続確立 (control + audio)
-  3. サーボ初期化 (脚部 0x40 必須, 首部 0x41 はオプション)
-  4. ディスプレイ初期化 (任意)
-  5. 音声パイプライン起動 (ウェイクワード検知ループ)
-  6. ディスパッチループ (Geminiからの応答 -> TTS/サーボ)
-  7. 終了処理 (サーボをneutralに戻す)
+edge/main.py  (Stage 3 音声統合版)
 """
 
 from __future__ import annotations
@@ -24,31 +13,16 @@ from pathlib import Path
 from shared.protocol.config import cfg
 from shared.protocol.messages import (
     MessageEnvelope, MessageType,
-    SystemStatus,
+    SystemStatus, ComponentStatus,
 )
 from edge.utils.connection import ConnectionManager
 from edge.audio.pipeline import AudioPipeline
-from edge.servo import ServoController
 
 log = logging.getLogger(__name__)
 
 
-# ── 感情 -> ポーズ マッピング ─────────────────────────────────
-EMOTION_TO_POSE = {
-    "neutral":   "neutral",
-    "happy":     "happy_wag",
-    "sad":       "sad_droop",
-    "surprised": "alert",
-    "thinking":  "thinking",
-    "excited":   "happy_wag",
-    "sleepy":    "sleep",
-    "angry":     "shake_head",
-}
-
-
 # ── ディスパッチループ ────────────────────────────────────────
-async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
-                         servo: ServoController) -> None:
+async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline) -> None:
     log.info("[dispatch] loop started")
     while True:
         try:
@@ -64,18 +38,8 @@ async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
         if mtype == MessageType.GEMINI_RESPONSE:
             log.info("[dispatch] GEMINI_RESPONSE: emotion=%s text=%s",
                      msg.emotion, (msg.text or "")[:80])
-
-            pose = EMOTION_TO_POSE.get(msg.emotion.value, "neutral")
-            asyncio.create_task(servo.execute_pose(pose))
-
             if msg.text:
                 asyncio.create_task(audio.speak(msg.text))
-
-        elif mtype == MessageType.POSE_COMMAND:
-            log.info("[dispatch] POSE_COMMAND: %s", msg.pose_name)
-            asyncio.create_task(servo.execute_pose(
-                msg.pose_name, msg.duration_ms, msg.easing
-            ))
 
         elif mtype == MessageType.HEARTBEAT:
             log.debug("[dispatch] heartbeat from server")
@@ -96,15 +60,20 @@ async def status_loop(conn: ConnectionManager) -> None:
         if not conn.control.is_connected:
             continue
 
-        cpu = psutil.cpu_percent(interval=None)
-        mem = psutil.virtual_memory().percent
-        temp = None
+        cpu   = psutil.cpu_percent(interval=None)
+        mem   = psutil.virtual_memory().percent
+        temp  = None
         try:
             temp = int(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000
         except Exception:
             pass
 
-        status = SystemStatus(node="edge", cpu_pct=cpu, mem_pct=mem, temp_c=temp)
+        status = SystemStatus(
+            node="edge",
+            cpu_pct=cpu,
+            mem_pct=mem,
+            temp_c=temp,
+        )
         await conn.control.send(MessageEnvelope(payload=status))
 
 
@@ -119,7 +88,6 @@ async def main() -> None:
 
     conn  = ConnectionManager()
     audio = AudioPipeline(conn)
-    servo = ServoController()
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -130,9 +98,6 @@ async def main() -> None:
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown, sig)
-
-    # サーボ初期化
-    await servo.init()
 
     # 接続
     await conn.start()
@@ -145,8 +110,8 @@ async def main() -> None:
     await audio.start()
 
     tasks = [
-        asyncio.create_task(dispatch_loop(conn, audio, servo), name="dispatch"),
-        asyncio.create_task(status_loop(conn),                 name="status"),
+        asyncio.create_task(dispatch_loop(conn, audio), name="dispatch"),
+        asyncio.create_task(status_loop(conn),          name="status"),
     ]
 
     await stop_event.wait()
@@ -155,7 +120,6 @@ async def main() -> None:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
     await audio.stop()
-    await servo.shutdown()
     await conn.stop()
     log.info("=== edge shutdown complete ===")
 

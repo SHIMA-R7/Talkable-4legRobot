@@ -1,0 +1,114 @@
+# config/settings.yaml
+# =====================
+# ロボットシステム設定ファイル
+# 機密情報 (APIキー等) は .env に記載し、このファイルには含めない
+
+system:
+  name: "RobotChan"
+  log_level: "INFO"          # DEBUG | INFO | WARNING | ERROR
+  log_file: "logs/robot.log"
+
+# --- Tailscale ネットワーク ---
+network:
+  # エッジデバイスから見たサーバーの Tailscale IP / ホスト名
+  server_host: "100.88.108.71"   # 実際の Tailscale IP に変更
+  server_port: 8000
+
+  # WebSocket エンドポイント
+  ws_audio_path:   "/ws/audio"
+  ws_control_path: "/ws/control"
+
+  # Tailscale Funnel (WebUI 用)
+  funnel_port: 443
+  webui_path: "/ui"
+
+  # 接続パラメータ
+  connect_timeout_sec: 10
+  reconnect_interval_sec: 5
+  max_reconnect_attempts: 0   # 0 = 無限リトライ
+  heartbeat_interval_sec: 15
+
+# --- 音声 ---
+audio:
+  device_name: "AIY-voice-hat-Sound-Card"
+  sample_rate: 16000
+  channels: 1
+  chunk_ms: 100
+  # VOSK モデルパス (エッジ側)
+  vosk_model_path: "/home/pi/models/vosk-model-ja-0.22"
+  wake_words:
+    - "ねえロボット"
+    - "ロボットちゃん"
+    - "hey robot"
+  wake_word_threshold: 0.7
+  # 発話終端検知: 無音がこの ms 続いたらストリーム終了
+  silence_threshold_ms: 1200
+  silence_amplitude: 500      # RMS閾値
+
+# --- カメラ ---
+camera:
+  device: 0                   # CSI カメラ
+  default_width: 640
+  default_height: 480
+  default_quality: 85
+  fps: 10
+  auto_wb: true
+  rotation: 0                 # 0 | 90 | 180 | 270
+
+# --- サーボ (PCA9685) ---
+servo:
+  i2c_bus: 1
+  i2c_address: 0x40
+  pwm_frequency: 50           # Hz
+  min_pulse_us: 500
+  max_pulse_us: 2500
+  neutral_pulse_us: 1500
+  # チャンネル割り当て (0-7)
+  channels:
+    head_pan:    0            # 頭部 左右
+    head_tilt:   1            # 頭部 前後
+    head_roll:   2            # 頭部 回転
+    arm_l_shoulder: 3        # 左腕 肩
+    arm_l_elbow: 4            # 左腕 肘
+    arm_r_shoulder: 5        # 右腕 肩
+    arm_r_elbow: 6            # 右腕 肘
+    body_tilt:   7            # 胴体 傾き
+  # 過負荷保護: 急激な変化をこの ms で制限
+  max_step_ms: 20
+  # 電源投入時の初期化待機 ms
+  init_wait_ms: 500
+
+# --- Gemini ---
+gemini:
+  model: "gemini-1.5-flash"
+  max_tokens: 1024
+  temperature: 0.85
+  # システムプロンプト (概要; 詳細は server/gemini/prompts.py)
+  system_prompt_key: "default_robot"
+  # Function Calling モード
+  tool_config:
+    mode: "AUTO"              # AUTO | ANY | NONE
+  # 自律思考ループ
+  autonomous_loop:
+    enabled: true
+    idle_trigger_sec: 30     # 無会話でこの秒後に自律思考
+    max_autonomous_tokens: 256
+
+# --- FastAPI サーバー ---
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1                  # asyncio シングルプロセス
+  reload: false
+  # CORS (開発中のみ)
+  cors_origins:
+    - "http://localhost:3000"
+    - "https://*.ts.net"      # Tailscale Funnel ドメイン
+
+# --- 安全機能 ---
+safety:
+  cpu_temp_max_c: 80          # これを超えたらサーボ停止
+  cpu_load_max_pct: 90
+  servo_stall_timeout_ms: 2000
+  # ウォッチドッグ: サーバーと接続が切れたら中立ポーズへ
+  watchdog_timeout_sec: 30

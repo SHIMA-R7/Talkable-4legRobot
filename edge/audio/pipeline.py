@@ -1,11 +1,19 @@
 """
 edge/audio/pipeline.py
 ======================
-AIY Voice HAT 音声パイプライン。
+AIY Voice HAT 音声パイプライン (実機検証済み)。
 
-AIYサウンドカードのデバイス名: snd_rpi_googlevoicehat_soundcar (card 1)
-PyAudio デバイス名で自動検出する。
-再生は plughw:1,0 相当 (plug経由でフォーマット変換)。
+ハードウェア制約:
+  AIY Voice HAT (snd_rpi_googlevoicehat_soundcar) は 48000Hz のみ対応。
+  VOSK / Gemini への送信は 16000Hz PCM16 を要求するため、
+  48kHz録音 -> 1/3間引きで16kHzにダウンサンプリングする。
+
+設計:
+  - PyAudio インスタンスは1つを使い回す (再生成によるデバイス競合を回避)
+  - ウェイクワード検知用ストリームと録音用ストリームは
+    open/close を切り替えつつ同じ PyAudio インスタンス上で運用する
+  - ストリームclose後は asyncio.sleep でデバイス解放を待つ
+  - TTSは espeak-ng でWAV生成 -> aplay (plughw:1,0) で再生
 """
 
 from __future__ import annotations
@@ -13,30 +21,36 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import struct
-import subprocess
 import tempfile
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
 try:
     import pyaudio
     import vosk
+    import numpy as np
     _AUDIO_OK = True
 except ImportError:
     _AUDIO_OK = False
-    log.warning("[audio] pyaudio/vosk not available")
+    log.warning("[audio] pyaudio/vosk/numpy not available — stub mode")
 
 from shared.protocol.config import cfg
-from shared.protocol.messages import (
-    AudioStreamEnd, AudioStreamStart, MessageEnvelope,
-)
+from shared.protocol.messages import AudioStreamEnd, AudioStreamStart, MessageEnvelope
 
-SAMPLE_RATE  = 16000
-CHANNELS     = 1
-CHUNK_FRAMES = 1600   # 100ms
+HW_RATE    = 48000   # AIY Voice HAT のネイティブレート
+VOSK_RATE  = 16000   # VOSK / Gemini 送信レート
+CHANNELS   = 1
+HW_CHUNK   = 4800    # 100ms @ 48kHz
+
+
+def _downsample(pcm48: bytes) -> bytes:
+    """48kHz PCM16 -> 16kHz PCM16 (1/3間引き)"""
+    arr = np.frombuffer(pcm48, dtype=np.int16)
+    return arr[::3].copy().tobytes()
 
 
 def _rms(pcm: bytes) -> float:
@@ -48,20 +62,18 @@ def _rms(pcm: bytes) -> float:
 
 
 def _find_aiy_device(pa: "pyaudio.PyAudio") -> Optional[int]:
-    """AIY Voice HAT のマイクデバイスインデックスを返す"""
     keywords = ["googlevoicehat", "aiy", "voicehat"]
     for i in range(pa.get_device_count()):
         info = pa.get_device_info_by_index(i)
         name = info["name"].lower()
         if any(k in name for k in keywords) and info["maxInputChannels"] > 0:
-            log.info("[audio] found AIY device: [%d] %s", i, info["name"])
+            log.info("[audio] AIY device: [%d] %s", i, info["name"])
             return i
     log.warning("[audio] AIY device not found — using default input")
     return None
 
 
 class WakeWordDetector:
-
     def __init__(self) -> None:
         self._rec = None
         self._wake_words = [w.lower() for w in cfg.audio.wake_words]
@@ -71,176 +83,155 @@ class WakeWordDetector:
             return
         log.info("[wake] loading model: %s", cfg.audio.vosk_model_path)
         model = vosk.Model(cfg.audio.vosk_model_path)
-        self._rec = vosk.KaldiRecognizer(model, SAMPLE_RATE)
-        log.info("[wake] model ready, words=%s", self._wake_words)
+        self._rec = vosk.KaldiRecognizer(model, VOSK_RATE)
+        log.info("[wake] ready, words=%s", self._wake_words)
 
-    def check(self, pcm: bytes) -> bool:
+    def check(self, pcm16: bytes) -> bool:
         if self._rec is None:
             return False
-        if self._rec.AcceptWaveform(pcm):
+        if self._rec.AcceptWaveform(pcm16):
             text = json.loads(self._rec.Result()).get("text", "").lower()
             if text:
                 log.info("[wake] heard: '%s'", text)
             if any(w in text for w in self._wake_words):
-                log.info("[wake] ★ WAKE WORD DETECTED")
+                log.info("[wake] * DETECTED")
                 return True
         return False
 
 
 class AudioPipeline:
     """
-    ウェイクワード検知 → PCMストリーミング → TTS再生 を管理する。
+    ウェイクワード検知 -> PCMストリーミング -> TTS再生 を管理する。
     """
 
     def __init__(self, connection_manager) -> None:
-        self._conn    = connection_manager
-        self._detector = WakeWordDetector()
-        self._running  = False
-        self._session_counter = 0
+        self._conn = connection_manager
+        self._det  = WakeWordDetector()
+        self._running = False
+        self._n = 0
 
     async def start(self) -> None:
         self._running = True
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._detector.load)
-        asyncio.create_task(self._listen_loop(), name="audio_listen")
+        await asyncio.get_running_loop().run_in_executor(None, self._det.load)
+        asyncio.create_task(self._loop(), name="audio_listen")
         log.info("[audio_pipeline] started")
 
     async def stop(self) -> None:
         self._running = False
 
-    # ── TTS 再生 ────────────────────────────────────────────
-    async def speak(self, text: str, language: str = "ja-JP") -> None:
-        """espeak-ng でテキストを読み上げる"""
-        log.info("[tts] speaking: '%s'", text[:60])
-        speed = "130"
-        lang  = "ja" if language.startswith("ja") else "en"
-
-        # AIY HAT は plughw:1,0 経由でないと鳴らないので
-        # espeak → wav → aplay とパイプ
+    # ── TTS ──────────────────────────────────────────────────
+    async def speak(self, text: str, lang: str = "ja-JP") -> None:
+        log.info("[tts] '%s'", text[:50])
+        l = "ja" if lang.startswith("ja") else "en"
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
-
         try:
-            # espeak-ng でwav生成
-            await asyncio.create_subprocess_exec(
-                "espeak-ng", "-v", lang, "-s", speed,
-                "-w", wav_path, text,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+            p = await asyncio.create_subprocess_exec(
+                "espeak-ng", "-v", l, "-s", "130", "-w", wav_path, text,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.sleep(0.3)  # 生成待ち
-
-            # aplay で AIY HAT に出力 (plughw でフォーマット自動変換)
-            proc = await asyncio.create_subprocess_exec(
+            await p.wait()
+            p2 = await asyncio.create_subprocess_exec(
                 "aplay", "-D", "plughw:1,0", wav_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await proc.wait()
+            await p2.wait()
         except Exception as exc:
             log.error("[tts] error: %s", exc)
         finally:
-            import os
             try:
                 os.unlink(wav_path)
             except Exception:
                 pass
 
     # ── メインループ ─────────────────────────────────────────
-    async def _listen_loop(self) -> None:
+    async def _loop(self) -> None:
         if not _AUDIO_OK:
-            log.warning("[audio_pipeline] stub mode — no pyaudio")
+            log.warning("[audio_pipeline] stub mode")
             return
 
-        pa     = pyaudio.PyAudio()
-        dev_idx = _find_aiy_device(pa)
+        loop = asyncio.get_running_loop()
+        pa  = pyaudio.PyAudio()
+        dev = _find_aiy_device(pa)
 
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=CHANNELS,
-            rate=SAMPLE_RATE,
-            input=True,
-            input_device_index=dev_idx,
-            frames_per_buffer=CHUNK_FRAMES,
-        )
-        log.info("[audio_pipeline] listening for wake word...")
+        def _open():
+            return pa.open(
+                format=pyaudio.paInt16, channels=CHANNELS,
+                rate=HW_RATE, input=True,
+                input_device_index=dev, frames_per_buffer=HW_CHUNK,
+            )
+
+        st = _open()
+        log.info("[audio_pipeline] listening (48kHz->16kHz)...")
 
         try:
             while self._running:
-                pcm = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
+                pcm48 = st.read(HW_CHUNK, exception_on_overflow=False)
+                pcm16 = _downsample(pcm48)
 
-                if self._detector.check(pcm):
-                    stream.stop_stream()
+                if self._det.check(pcm16):
+                    st.stop_stream()
+                    st.close()
+                    await asyncio.sleep(0.3)
 
-                    # 応答音
                     asyncio.create_task(self.speak("はい、なんでしょう"))
+                    await self._record(pa, dev, loop)
 
-                    await self._stream_once(pa, dev_idx)
-                    stream.start_stream()
+                    await asyncio.sleep(0.3)
+                    st = _open()
                     log.info("[audio_pipeline] back to listening...")
-
         finally:
-            stream.stop_stream()
-            stream.close()
+            try:
+                st.stop_stream()
+                st.close()
+            except Exception:
+                pass
             pa.terminate()
 
-    async def _stream_once(
-        self,
-        pa: "pyaudio.PyAudio",
-        dev_idx: Optional[int],
-    ) -> None:
-        """発話1回分をストリーミング送信する"""
-        self._session_counter += 1
-        sid     = f"sess_{self._session_counter:04d}"
-        sid_int = self._session_counter
+    async def _record(self, pa, dev, loop) -> None:
+        self._n += 1
+        sid     = f"sess_{self._n:04d}"
+        sid_int = self._n
 
-        # セッション開始通知
-        start = AudioStreamStart(session_id=sid)
-        await self._conn.control.send(MessageEnvelope(payload=start))
+        await self._conn.control.send(MessageEnvelope(payload=AudioStreamStart(session_id=sid)))
 
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=CHANNELS,
-            rate=SAMPLE_RATE,
-            input=True,
-            input_device_index=dev_idx,
-            frames_per_buffer=CHUNK_FRAMES,
-        )
+        def _open_rec():
+            return pa.open(
+                format=pyaudio.paInt16, channels=CHANNELS,
+                rate=HW_RATE, input=True,
+                input_device_index=dev, frames_per_buffer=HW_CHUNK,
+            )
 
-        t0         = time.time()
-        total      = 0
-        silence_ms = 0
-        log.info("[stream] recording (session=%s)...", sid)
+        st = await loop.run_in_executor(None, _open_rec)
+        t0 = time.time()
+        total = 0
+        sil = 0
+        log.info("[stream] recording %s...", sid)
 
         try:
             while True:
-                pcm    = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
-                total += len(pcm)
-
-                # 音声チャネルに送信
-                header = sid_int.to_bytes(4, "big")
-                asyncio.create_task(
-                    self._conn.audio.send_audio(sid_int, pcm)
+                pcm48 = await loop.run_in_executor(
+                    None, lambda: st.read(HW_CHUNK, exception_on_overflow=False)
                 )
+                pcm16 = _downsample(pcm48)
+                total += len(pcm16)
 
-                # 無音判定
-                rms = _rms(pcm)
-                if rms < cfg.audio.silence_amplitude:
-                    silence_ms += cfg.audio.chunk_ms
-                else:
-                    silence_ms = 0
+                asyncio.create_task(self._conn.audio.send_audio(sid_int, pcm16))
 
-                if silence_ms >= cfg.audio.silence_threshold_ms:
-                    log.info("[stream] silence detected — end")
+                rms = _rms(pcm16)
+                sil = sil + 100 if rms < cfg.audio.silence_amplitude else 0
+
+                if sil >= cfg.audio.silence_threshold_ms:
+                    log.info("[stream] silence -> end")
                     break
                 if time.time() - t0 > 30:
-                    log.warning("[stream] max duration reached")
+                    log.warning("[stream] timeout")
                     break
         finally:
-            stream.stop_stream()
-            stream.close()
+            await loop.run_in_executor(None, lambda: (st.stop_stream(), st.close()))
 
-        dur_ms = int((time.time() - t0) * 1000)
-        end = AudioStreamEnd(session_id=sid, duration_ms=dur_ms, total_bytes=total)
-        await self._conn.control.send(MessageEnvelope(payload=end))
-        log.info("[stream] done: %dms / %d bytes", dur_ms, total)
+        dur = int((time.time() - t0) * 1000)
+        await self._conn.control.send(
+            MessageEnvelope(payload=AudioStreamEnd(session_id=sid, duration_ms=dur, total_bytes=total))
+        )
+        log.info("[stream] done %dms/%dbytes", dur, total)

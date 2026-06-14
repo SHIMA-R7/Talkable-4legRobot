@@ -1,0 +1,21 @@
+# requirements-server.txt
+# Python 3.11+ 推奨
+
+# Web フレームワーク
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+websockets==12.0
+
+# データバリデーション
+pydantic==2.7.1
+pydantic-settings==2.2.1
+
+# 設定
+pyyaml==6.0.1
+python-dotenv==1.0.1
+
+# Gemini
+google-generativeai==0.7.0
+
+# ユーティリティ
+psutil==5.9.8

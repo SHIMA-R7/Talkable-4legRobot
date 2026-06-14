@@ -1,3 +1,4 @@
+# shared/protocol/__init__.py
 from .messages import (
     AudioChunk, AudioStreamStart, AudioStreamEnd,
     ServoCommand, PoseCommand, CameraRequest, CameraFrame,
@@ -5,7 +6,6 @@ from .messages import (
     SystemStatus, ErrorMessage,
     MessageType, MessageEnvelope,
 )
-from .config import cfg, load_config
 
 __all__ = [
     "AudioChunk", "AudioStreamStart", "AudioStreamEnd",
@@ -13,5 +13,4 @@ __all__ = [
     "GeminiRequest", "GeminiResponse",
     "SystemStatus", "ErrorMessage",
     "MessageType", "MessageEnvelope",
-    "cfg", "load_config",
 ]

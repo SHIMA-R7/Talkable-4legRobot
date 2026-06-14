@@ -10,4 +10,3 @@ logs/
 *.log
 .venv/
 venv/
-robot-venv/

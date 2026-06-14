@@ -2,6 +2,7 @@
 server/utils/logging.py
 ========================
 構造化ログ設定。
+uvicorn のログとアプリログを統一フォーマットで出力する。
 """
 
 from __future__ import annotations
@@ -30,5 +31,6 @@ def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
 
     logging.basicConfig(level=numeric, format=_FMT, datefmt=_DATE_FMT, handlers=handlers)
 
+    # uvicorn の冗長ログを抑制
     for noisy in ("uvicorn.access", "websockets.server"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

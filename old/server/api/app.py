@@ -4,30 +4,29 @@ server/api/app.py
 FastAPI メインアプリ。
 
 エンドポイント:
-  WS  /ws/audio          音声バイナリストリーム受信
-  WS  /ws/control         JSON 双方向制御チャネル
-  GET  /api/status        システム状態照会
-  GET  /health            ヘルスチェック
-
-起動例:
-  python -m uvicorn server.api.app:app --host 0.0.0.0 --port 8000 \
-      --log-level info --timeout-keep-alive 120
+  WS  /ws/audio      音声バイナリストリーム受信
+  WS  /ws/control    JSON 双方向制御チャネル
+  GET  /api/status   システム状態照会
+  POST /api/camera/frame  カメラフレーム受信
+  GET  /health       ヘルスチェック (Tailscale Funnel 用)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import time
 from contextlib import asynccontextmanager
 from typing import Dict
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from shared.protocol.messages import (
     MessageEnvelope, MessageType,
-    SystemStatus, ComponentStatus, Heartbeat,
+    SystemStatus, ComponentStatus, ErrorMessage, Heartbeat,
+    AudioStreamStart, AudioStreamEnd,
     GeminiResponse,
 )
 from shared.protocol.config import cfg
@@ -36,17 +35,24 @@ from server.gemini.client import GeminiClient
 
 log = logging.getLogger(__name__)
 
-
+# ---------------------------------------------------------------------------
+# アプリケーション状態
+# ---------------------------------------------------------------------------
 class AppState:
     def __init__(self) -> None:
         self.gemini: GeminiClient | None = None
+        # アクティブな制御 WebSocket (エッジ1台を想定)
         self.control_ws: WebSocket | None = None
+        # セッションID → 受信バイト数
         self.audio_sessions: Dict[int, int] = {}
         self.started_at: float = time.time()
 
 state = AppState()
 
 
+# ---------------------------------------------------------------------------
+# ライフサイクル
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging(cfg.system.log_level)
@@ -62,18 +68,29 @@ async def lifespan(app: FastAPI):
         await state.gemini.stop()
 
 
-app = FastAPI(title=f"{cfg.system.name} Server", version="1.0.0", lifespan=lifespan)
+# ---------------------------------------------------------------------------
+# FastAPI インスタンス
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title=f"{cfg.system.name} Server",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cfg.server.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---------------------------------------------------------------------------
+# ヘルパー: エッジへの送信
+# ---------------------------------------------------------------------------
 async def send_to_edge(envelope: MessageEnvelope) -> bool:
+    """制御チャネル経由でエッジにメッセージを送る"""
     ws = state.control_ws
     if ws is None:
         log.warning("send_to_edge: no edge connected")
@@ -87,10 +104,14 @@ async def send_to_edge(envelope: MessageEnvelope) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# WebSocket: 音声チャネル
+# ---------------------------------------------------------------------------
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket):
     await ws.accept()
     log.info("[audio] edge connected from %s", ws.client)
+    remote_addr = ws.client.host if ws.client else "unknown"
 
     try:
         while True:
@@ -99,6 +120,7 @@ async def ws_audio(ws: WebSocket):
                 log.warning("[audio] frame too short (%d bytes)", len(data))
                 continue
 
+            # 先頭 4 byte: セッション ID (uint32 BE)
             session_id = struct.unpack(">I", data[:4])[0]
             pcm_chunk  = data[4:]
 
@@ -108,23 +130,29 @@ async def ws_audio(ws: WebSocket):
 
             state.audio_sessions[session_id] += len(pcm_chunk)
 
+            # Gemini へ PCM チャンクを転送
             if state.gemini:
                 await state.gemini.feed_audio(session_id, pcm_chunk)
 
     except WebSocketDisconnect:
-        log.info("[audio] edge disconnected")
+        log.info("[audio] edge disconnected (%s)", remote_addr)
     except Exception as exc:
         log.error("[audio] error: %s", exc)
     finally:
+        # セッションクリーンアップ
         state.audio_sessions.clear()
 
 
+# ---------------------------------------------------------------------------
+# WebSocket: 制御チャネル
+# ---------------------------------------------------------------------------
 @app.websocket("/ws/control")
 async def ws_control(ws: WebSocket):
     await ws.accept()
     log.info("[ctrl] edge connected from %s", ws.client)
     state.control_ws = ws
 
+    # Gemini のコールバックを登録: Gemini が応答を生成したら制御チャネル経由でエッジへ送る
     if state.gemini:
         state.gemini.set_response_callback(_on_gemini_response)
 
@@ -145,6 +173,7 @@ async def ws_control(ws: WebSocket):
 
 
 async def _handle_control_message(raw: str) -> None:
+    """受信した制御メッセージをルーティングする"""
     try:
         env = MessageEnvelope.from_json(raw)
     except Exception as exc:
@@ -155,6 +184,7 @@ async def _handle_control_message(raw: str) -> None:
     mtype = msg.type
 
     if mtype == MessageType.HEARTBEAT:
+        # エコーバック
         pong = MessageEnvelope(payload=Heartbeat(node="server"))
         await send_to_edge(pong)
 
@@ -170,10 +200,11 @@ async def _handle_control_message(raw: str) -> None:
             await state.gemini.finalize_session(msg.session_id)
 
     elif mtype == MessageType.SYSTEM_STATUS:
-        log.debug("[ctrl] edge status: cpu=%.1f%% temp=%s°C", msg.cpu_pct, msg.temp_c)
+        log.debug("[ctrl] edge status: cpu=%.1f%% temp=%s°C",
+                  msg.cpu_pct, msg.temp_c)
 
     elif mtype == MessageType.FUNCTION_RESULT:
-        log.info("[ctrl] function result: %s -> %s", msg.name, msg.result)
+        log.info("[ctrl] function result: %s → %s", msg.name, msg.result)
         if state.gemini:
             await state.gemini.receive_function_result(msg)
 
@@ -182,10 +213,14 @@ async def _handle_control_message(raw: str) -> None:
 
 
 async def _on_gemini_response(response: GeminiResponse) -> None:
+    """Gemini 応答をエッジに転送するコールバック"""
     env = MessageEnvelope(payload=response)
     await send_to_edge(env)
 
 
+# ---------------------------------------------------------------------------
+# REST: ヘルスチェック
+# ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     uptime = int(time.time() - state.started_at)
@@ -197,6 +232,9 @@ async def health():
     }
 
 
+# ---------------------------------------------------------------------------
+# REST: システム状態
+# ---------------------------------------------------------------------------
 @app.get("/api/status")
 async def api_status():
     components = [
@@ -211,16 +249,22 @@ async def api_status():
             detail=f"model={cfg.gemini.model}" if state.gemini else "not initialized",
         ),
     ]
-    status = SystemStatus(node="server", components=components)
+    status = SystemStatus(
+        node="server",
+        components=components,
+    )
     return status.model_dump()
 
 
+# ---------------------------------------------------------------------------
+# エントリーポイント
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "server.api.app:app",
         host=cfg.server.host,
         port=cfg.server.port,
+        reload=cfg.server.reload,
         log_level=cfg.system.log_level.lower(),
-        timeout_keep_alive=120,
     )

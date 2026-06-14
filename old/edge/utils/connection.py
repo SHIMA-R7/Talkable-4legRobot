@@ -6,31 +6,40 @@ edge/utils/connection.py
 - JSON 制御チャネル (/ws/control) と
   音声バイナリチャネル (/ws/audio) を管理する。
 - 切断時の自動再接続、ハートビート送信を担う。
-
-注意: websockets 13+ では ClientConnection に `.closed` 属性が無くなり、
-代わりに `.close_code` (None なら接続中) を使う。
+- asyncio.Queue でメッセージを非同期に受け渡す。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import websockets
 import websockets.exceptions
 
-from shared.protocol.messages import Heartbeat, MessageEnvelope
+from shared.protocol.messages import (
+    Heartbeat, MessageEnvelope, MessageType,
+    AUDIO_CHUNK_BYTES,
+)
 from shared.protocol.config import cfg
 
 log = logging.getLogger(__name__)
 
+# バイナリ音声フレームのセッションIDヘッダサイズ (uint32 BE)
 _SESSION_ID_BYTES = 4
 
 
 class ControlChannel:
+    """
+    JSON 双方向制御チャネル。
+    受信メッセージは recv_queue に積む。
+    送信は send() を呼ぶ。
+    """
+
     def __init__(self) -> None:
-        self._ws: Optional[websockets.ClientConnection] = None
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = asyncio.Event()
         self.recv_queue: asyncio.Queue[MessageEnvelope] = asyncio.Queue(maxsize=64)
         self._send_lock = asyncio.Lock()
@@ -42,6 +51,7 @@ class ControlChannel:
         return self._ws is not None and self._ws.close_code is None
 
     async def start(self) -> None:
+        """バックグラウンドで接続ループを開始する"""
         self._running = True
         asyncio.create_task(self._connect_loop(), name="ctrl_connect_loop")
         asyncio.create_task(self._heartbeat_loop(), name="ctrl_heartbeat")
@@ -52,6 +62,7 @@ class ControlChannel:
             await self._ws.close()
 
     async def send(self, envelope: MessageEnvelope) -> bool:
+        """エンベロープを JSON として送信。失敗時は False を返す"""
         if not self.is_connected:
             log.warning("[ctrl] send skipped: not connected")
             return False
@@ -69,7 +80,7 @@ class ControlChannel:
             f"ws://{cfg.network.server_host}:{cfg.network.server_port}"
             f"{cfg.network.ws_control_path}"
         )
-        max_attempts = cfg.network.max_reconnect_attempts
+        max_attempts = cfg.network.max_reconnect_attempts  # 0 = 無限
 
         while self._running:
             try:
@@ -77,8 +88,8 @@ class ControlChannel:
                 async with websockets.connect(
                     uri,
                     open_timeout=cfg.network.connect_timeout_sec,
-                    ping_interval=None,
-                    max_size=1024 * 1024,
+                    ping_interval=None,   # 独自ハートビートを使う
+                    max_size=1024 * 1024, # 1 MB
                 ) as ws:
                     self._ws = ws
                     self._connected.set()
@@ -102,7 +113,7 @@ class ControlChannel:
             log.info("[ctrl] retry in %.1f s (attempt %d)", wait, self._reconnect_count)
             await asyncio.sleep(wait)
 
-    async def _recv_loop(self, ws: "websockets.ClientConnection") -> None:
+    async def _recv_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
         async for raw in ws:
             if not isinstance(raw, str):
                 log.debug("[ctrl] unexpected binary frame, ignored")
@@ -124,7 +135,7 @@ class ControlChannel:
 
     async def _handle_disconnect(self) -> None:
         self._connected.clear()
-        if self._ws and self._ws.close_code is None:
+        if self._ws and not self._ws.closed:
             try:
                 await self._ws.close()
             except Exception:
@@ -140,8 +151,14 @@ class ControlChannel:
 
 
 class AudioChannel:
+    """
+    音声バイナリ WebSocket チャネル。
+    PCM データを連続バイナリフレームとして送信する。
+    各フレーム先頭 4 byte はセッションID (uint32 BE)。
+    """
+
     def __init__(self) -> None:
-        self._ws: Optional[websockets.ClientConnection] = None
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = asyncio.Event()
         self._running = False
         self._send_lock = asyncio.Lock()
@@ -160,6 +177,7 @@ class AudioChannel:
             await self._ws.close()
 
     async def send_audio(self, session_id: int, pcm_chunk: bytes) -> bool:
+        """session_id (uint32) + PCM をバイナリフレームで送信"""
         if not self.is_connected:
             return False
         try:
@@ -186,11 +204,12 @@ class AudioChannel:
                     uri,
                     open_timeout=cfg.network.connect_timeout_sec,
                     ping_interval=None,
-                    max_size=10 * 1024 * 1024,
+                    max_size=10 * 1024 * 1024,  # 10 MB (音声用に大きめ)
                 ) as ws:
                     self._ws = ws
                     self._connected.set()
                     log.info("[audio] connected")
+                    # 音声チャネルは送信専用なので recv は無視
                     await ws.wait_closed()
             except Exception as exc:
                 log.warning("[audio] disconnected: %s", exc)
@@ -211,6 +230,8 @@ class AudioChannel:
 
 
 class ConnectionManager:
+    """エッジの全 WebSocket 接続をまとめて管理するファサード"""
+
     def __init__(self) -> None:
         self.control = ControlChannel()
         self.audio   = AudioChannel()
