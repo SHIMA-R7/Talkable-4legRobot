@@ -30,6 +30,8 @@ from edge.utils.connection import ConnectionManager
 from edge.utils.function_executor import FunctionExecutor
 from edge.audio.pipeline import AudioPipeline
 from edge.servo import ServoController
+from edge.display.controller import DisplayController
+from edge.display.logger import DisplayLogger
 
 log = logging.getLogger(__name__)
 
@@ -140,6 +142,16 @@ async def main() -> None:
     servo = ServoController()
     executor = FunctionExecutor(servo, audio)
 
+    # ディスプレイ初期化 + ログ表示
+    display = DisplayController(
+        driver=cfg.display.driver,
+        width=cfg.display.width,
+        height=cfg.display.height,
+    )
+    await display.init()
+    disp_logger = DisplayLogger(display)
+    disp_logger.install()  # 以後のloggingが自動的にディスプレイに流れる
+
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -176,6 +188,7 @@ async def main() -> None:
     await audio.stop()
     await servo.shutdown()
     await conn.stop()
+    await display.shutdown()
     log.info("=== edge shutdown complete ===")
 
 
