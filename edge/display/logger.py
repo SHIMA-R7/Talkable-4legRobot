@@ -90,6 +90,9 @@ class DisplayLogger:
         """logging.root にハンドラを追加する。asyncio ループ開始後に呼ぶこと。"""
         self._loop = asyncio.get_event_loop()
         logging.root.addHandler(self._handler)
+        # 起動メッセージを即時プッシュして初回描画をトリガー
+        self._push("=== RobotChan ===", logging.INFO)
+        self._push("Display logger OK", logging.INFO)
         # バックグラウンドで描画ループを起動
         asyncio.create_task(self._render_loop(), name="display_render")
         logging.getLogger(__name__).info("[display] logger installed")
@@ -102,6 +105,8 @@ class DisplayLogger:
 
     async def _render_loop(self) -> None:
         """変化があるたびにディスプレイを再描画する"""
+        # 起動時に即時描画
+        await self._render()
         while True:
             await self._dirty.wait()
             self._dirty.clear()
