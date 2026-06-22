@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from shared.protocol.messages import (
     MessageEnvelope, MessageType,
     SystemStatus, ComponentStatus, Heartbeat,
-    GeminiResponse,
+    GeminiResponse, FunctionCall,
 )
 from shared.protocol.config import cfg
 from server.utils.logging import setup_logging
@@ -89,6 +89,12 @@ async def send_to_edge(envelope: MessageEnvelope) -> bool:
 
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket):
+    """
+    音声バイナリチャネル。
+    現在は edge 側で Google STT によりテキスト化してから /ws/control 経由で
+    GeminiRequest を送る方式に変更したため、このチャネルは Gemini には使われない。
+    将来的にカメラ画像のストリーミング等に転用できるよう構造は残してある。
+    """
     await ws.accept()
     log.info("[audio] edge connected from %s", ws.client)
 
@@ -108,9 +114,6 @@ async def ws_audio(ws: WebSocket):
 
             state.audio_sessions[session_id] += len(pcm_chunk)
 
-            if state.gemini:
-                await state.gemini.feed_audio(session_id, pcm_chunk)
-
     except WebSocketDisconnect:
         log.info("[audio] edge disconnected")
     except Exception as exc:
@@ -127,6 +130,7 @@ async def ws_control(ws: WebSocket):
 
     if state.gemini:
         state.gemini.set_response_callback(_on_gemini_response)
+        state.gemini.set_function_call_sender(_send_function_call_to_edge)
 
     try:
         while True:
@@ -142,6 +146,7 @@ async def ws_control(ws: WebSocket):
             state.control_ws = None
         if state.gemini:
             state.gemini.set_response_callback(None)
+            state.gemini.set_function_call_sender(None)
 
 
 async def _handle_control_message(raw: str) -> None:
@@ -159,15 +164,20 @@ async def _handle_control_message(raw: str) -> None:
         await send_to_edge(pong)
 
     elif mtype == MessageType.AUDIO_STREAM_START:
+        # 録音開始の進捗ログのみ。Gemini呼び出しはGEMINI_REQUEST受信時に行う
+        # (旧: ここでbegin_session()してPCM蓄積していたが、
+        #  edge側でGoogle STTテキスト化する方式に変更したため不要になった)
         log.info("[ctrl] audio stream start: session=%s", msg.session_id)
-        if state.gemini:
-            await state.gemini.begin_session(msg.session_id)
 
     elif mtype == MessageType.AUDIO_STREAM_END:
         log.info("[ctrl] audio stream end: session=%s duration=%dms bytes=%d",
                  msg.session_id, msg.duration_ms, msg.total_bytes)
-        if state.gemini:
-            await state.gemini.finalize_session(msg.session_id)
+
+    elif mtype == MessageType.GEMINI_REQUEST:
+        log.info("[ctrl] gemini request: session=%s text='%s'",
+                  msg.session_id, (msg.text_input or "")[:80])
+        if state.gemini and msg.text_input:
+            await state.gemini.process_text_request(msg.session_id, msg.text_input)
 
     elif mtype == MessageType.SYSTEM_STATUS:
         log.debug("[ctrl] edge status: cpu=%.1f%% temp=%s°C", msg.cpu_pct, msg.temp_c)
@@ -184,6 +194,16 @@ async def _handle_control_message(raw: str) -> None:
 async def _on_gemini_response(response: GeminiResponse) -> None:
     env = MessageEnvelope(payload=response)
     await send_to_edge(env)
+
+
+async def _send_function_call_to_edge(fc: FunctionCall) -> None:
+    """GeminiClient からの Function Call を edge に転送する"""
+    log.info("[ctrl] forwarding function_call: %s(%s) call_id=%s",
+              fc.name, fc.arguments, fc.call_id)
+    env = MessageEnvelope(payload=fc)
+    ok = await send_to_edge(env)
+    if not ok:
+        log.warning("[ctrl] failed to forward function_call %s — edge not connected", fc.call_id)
 
 
 @app.get("/health")

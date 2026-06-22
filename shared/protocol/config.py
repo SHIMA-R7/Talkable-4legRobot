@@ -26,16 +26,21 @@ class NetworkConfig(BaseModel):
     heartbeat_interval_sec:  int   = 15
 
 
+class GoogleSttConfig(BaseModel):
+    language_code: str = "ja-JP"
+
+
+class VoicevoxConfig(BaseModel):
+    enabled:     bool  = True
+    host:        str   = "127.0.0.1"
+    port:        int   = 50021
+    speaker_id:  int   = 2
+    timeout_sec: float = 10.0
+
+
 class AudioConfig(BaseModel):
-    device_name:          str   = "AIY-voice-hat-Sound-Card"
-    sample_rate:          int   = 16000
-    channels:             int   = 1
-    chunk_ms:             int   = 100
-    vosk_model_path:      str   = "/home/pi/models/vosk-model-small-ja-0.22"
-    wake_words:           List[str] = Field(default_factory=lambda: ["ねえロボット"])
-    wake_word_threshold:  float = 0.7
-    silence_threshold_ms: int   = 1200
-    silence_amplitude:    int   = 500
+    device_name: str = "AIY-voice-hat-Sound-Card"
+    wake_words:  List[str] = Field(default_factory=lambda: ["ねえロボット"])
 
 
 class ServoSubConfig(BaseModel):
@@ -86,7 +91,7 @@ class ToolConfig(BaseModel):
 
 
 class GeminiConfig(BaseModel):
-    model:           str   = "gemini-1.5-flash"
+    model:           str   = "gemini-2.5-flash-lite"
     max_tokens:      int   = 1024
     temperature:     float = 0.85
     tool_config:     ToolConfig = Field(default_factory=ToolConfig)
@@ -120,6 +125,8 @@ class RobotConfig(BaseModel):
     system:  SystemConfig  = Field(default_factory=SystemConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     audio:   AudioConfig   = Field(default_factory=AudioConfig)
+    google_stt: GoogleSttConfig = Field(default_factory=GoogleSttConfig)
+    voicevox: VoicevoxConfig = Field(default_factory=VoicevoxConfig)
     servo:   ServoConfig   = Field(default_factory=ServoConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     camera:  CameraConfig  = Field(default_factory=CameraConfig)

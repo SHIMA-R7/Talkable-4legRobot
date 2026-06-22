@@ -38,9 +38,7 @@ ROBOT_FUNCTIONS: List[Dict[str, Any]] = [
                 },
                 "duration_ms": {
                     "type": "integer",
-                    "description": "ポーズ保持時間 (ミリ秒)。省略時はポーズごとのデフォルト。",
-                    "minimum": 100,
-                    "maximum": 10000,
+                    "description": "ポーズ保持時間 (ミリ秒、100〜10000)。省略時はポーズごとのデフォルト。",
                 },
             },
             "required": ["pose_name"],
@@ -62,9 +60,7 @@ ROBOT_FUNCTIONS: List[Dict[str, Any]] = [
                 },
                 "intensity": {
                     "type": "number",
-                    "description": "感情の強度 0.0〜1.0。省略時は 0.7。",
-                    "minimum": 0.0,
-                    "maximum": 1.0,
+                    "description": "感情の強度 (0.0〜1.0)。省略時は 0.7。",
                 },
             },
             "required": ["emotion"],
@@ -78,31 +74,10 @@ ROBOT_FUNCTIONS: List[Dict[str, Any]] = [
             "properties": {
                 "steps": {
                     "type": "integer",
-                    "description": "歩数（サイクル数）。デフォルト2。",
-                    "minimum": 1,
-                    "maximum": 20,
+                    "description": "歩数（サイクル数、1〜20）。デフォルト2。",
                 },
             },
             "required": [],
-        },
-    },
-    {
-        "name": "speak",
-        "description": "指定したテキストをスピーカーで読み上げる。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "読み上げるテキスト",
-                    "maxLength": 500,
-                },
-                "language": {
-                    "type": "string",
-                    "enum": ["ja-JP", "en-US"],
-                },
-            },
-            "required": ["text"],
         },
     },
     {

@@ -17,21 +17,31 @@ network:
   max_reconnect_attempts: 0
   heartbeat_interval_sec: 15
 
+# --- 音声認識言語設定 ---
+# speech_recognition + Google Web Speech API (APIキー不要) で
+# ウェイクワード検知・本文認識の両方を行う
+google_stt:
+  language_code: "ja-JP"
+
+# --- VOICEVOX (音声合成) ---
+# サーバー(Windows)側でVOICEVOXエンジンを起動し、Tailscale経由でアクセスする
+# 起動: run.exe (デフォルトポート50021)
+voicevox:
+  enabled: true
+  host: "100.88.108.71"   # サーバーのTailscale IP
+  port: 50021
+  speaker_id: 2           # 四国めたん(ノーマル)。VOICEVOX /speakers で確認可能
+  timeout_sec: 10
+
 # --- 音声 (AIY Voice HAT) ---
 audio:
   device_name: "snd_rpi_googlevoicehat_soundcar"
-  sample_rate: 16000          # Vosk/Gemini向け(HW実際は48000、pipeline側で変換)
-  channels: 1
-  chunk_ms: 100
-  vosk_model_path: "/home/shima/models/vosk-model-small-ja-0.22"
   wake_words:
     - "ねえロボット"
     - "ロボットちゃん"
     - "hey robot"
     - "アリス"
-  wake_word_threshold: 0.7
-  silence_threshold_ms: 1200
-  silence_amplitude: 500
+    - "あり"
 
 # --- サーボ (PCA9685) ---
 # 脚部 0x40 (動作確認済み) / 首部 0x41 (基板放棄・未接続)
@@ -82,7 +92,7 @@ camera:
 
 # --- Gemini ---
 gemini:
-  model: "gemini-1.5-flash"
+  model: "gemini-2.5-flash-lite"
   max_tokens: 1024
   temperature: 0.85
   tool_config:

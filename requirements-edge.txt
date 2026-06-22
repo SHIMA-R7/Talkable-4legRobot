@@ -13,11 +13,13 @@ websockets
 pydantic
 pyyaml
 python-dotenv
+requests
 
 # 音声
+# speech_recognition の recognize_google() (Google Web Speech API, APIキー不要)
+# でウェイクワード検知・本文認識の両方を行う。Vosk/google-cloud-speechは廃止。
 pyaudio
-vosk
-numpy
+SpeechRecognition
 
 # ハードウェア制御
 # サーボ: 旧Adafruit_PCA9685ライブラリ (busnum=1 明示指定が必要なため)

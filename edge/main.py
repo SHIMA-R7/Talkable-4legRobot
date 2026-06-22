@@ -24,9 +24,10 @@ from pathlib import Path
 from shared.protocol.config import cfg
 from shared.protocol.messages import (
     MessageEnvelope, MessageType,
-    SystemStatus,
+    SystemStatus, FunctionResult,
 )
 from edge.utils.connection import ConnectionManager
+from edge.utils.function_executor import FunctionExecutor
 from edge.audio.pipeline import AudioPipeline
 from edge.servo import ServoController
 
@@ -48,7 +49,7 @@ EMOTION_TO_POSE = {
 
 # ── ディスパッチループ ────────────────────────────────────────
 async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
-                         servo: ServoController) -> None:
+                         servo: ServoController, executor: FunctionExecutor) -> None:
     log.info("[dispatch] loop started")
     while True:
         try:
@@ -65,11 +66,19 @@ async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
             log.info("[dispatch] GEMINI_RESPONSE: emotion=%s text=%s",
                      msg.emotion, (msg.text or "")[:80])
 
+            # Geminiが execute_pose/set_emotion を呼ばなかった場合のフォールバック。
+            # 既にFunction Call経由でポーズ実行済みでも、同じポーズへの再実行は
+            # 安全 (アイドル時の状態確定として機能する) なため許容する。
             pose = EMOTION_TO_POSE.get(msg.emotion.value, "neutral")
             asyncio.create_task(servo.execute_pose(pose))
 
             if msg.text:
                 asyncio.create_task(audio.speak(msg.text))
+
+        elif mtype == MessageType.FUNCTION_CALL:
+            log.info("[dispatch] FUNCTION_CALL: %s(%s) call_id=%s",
+                     msg.name, msg.arguments, msg.call_id)
+            asyncio.create_task(_handle_function_call(conn, executor, msg))
 
         elif mtype == MessageType.POSE_COMMAND:
             log.info("[dispatch] POSE_COMMAND: %s", msg.pose_name)
@@ -85,6 +94,15 @@ async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
 
         else:
             log.debug("[dispatch] unhandled: %s", mtype)
+
+
+async def _handle_function_call(conn: ConnectionManager, executor: FunctionExecutor,
+                                  fc) -> None:
+    """FunctionCall を実行し、結果を FunctionResult として送信する"""
+    result: FunctionResult = await executor.execute(fc)
+    await conn.control.send(MessageEnvelope(payload=result))
+    log.info("[dispatch] FUNCTION_RESULT sent: %s -> ok=%s",
+              result.name, result.error is None)
 
 
 # ── ステータス報告ループ ─────────────────────────────────────
@@ -120,6 +138,7 @@ async def main() -> None:
     conn  = ConnectionManager()
     audio = AudioPipeline(conn)
     servo = ServoController()
+    executor = FunctionExecutor(servo, audio)
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -145,8 +164,8 @@ async def main() -> None:
     await audio.start()
 
     tasks = [
-        asyncio.create_task(dispatch_loop(conn, audio, servo), name="dispatch"),
-        asyncio.create_task(status_loop(conn),                 name="status"),
+        asyncio.create_task(dispatch_loop(conn, audio, servo, executor), name="dispatch"),
+        asyncio.create_task(status_loop(conn),                          name="status"),
     ]
 
     await stop_event.wait()

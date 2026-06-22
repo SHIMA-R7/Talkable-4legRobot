@@ -135,10 +135,11 @@ class PoseCommand(RobotMessage):
     easing:      Optional[str] = None
 
 
-class FunctionCall(BaseModel):
+class FunctionCall(RobotMessage):
+    type:      Literal[MessageType.FUNCTION_CALL] = MessageType.FUNCTION_CALL
     name:      str
     call_id:   str
-    arguments: Dict[str, Any]
+    arguments: Dict[str, Any] = Field(default_factory=dict)
 
 
 class FunctionResult(RobotMessage):
@@ -200,7 +201,7 @@ _Payload = Union[
     CameraRequest, CameraFrame,
     ServoCommand, PoseCommand,
     GeminiRequest, GeminiResponse,
-    FunctionResult,
+    FunctionCall, FunctionResult,
     SystemStatus, Heartbeat, ErrorMessage,
 ]
 

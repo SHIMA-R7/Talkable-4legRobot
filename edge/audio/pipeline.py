@@ -1,127 +1,203 @@
 """
 edge/audio/pipeline.py
 ======================
-AIY Voice HAT 音声パイプライン (実機検証済み)。
+AIY Voice HAT 音声パイプライン (speech_recognition / Google Web Speech API版)。
 
-ハードウェア制約:
-  AIY Voice HAT (snd_rpi_googlevoicehat_soundcar) は 48000Hz のみ対応。
-  VOSK / Gemini への送信は 16000Hz PCM16 を要求するため、
-  48kHz録音 -> 1/3間引きで16kHzにダウンサンプリングする。
+設計変更の経緯:
+  旧: Vosk常時ストリーミングでウェイクワード検知 -> Google Cloud STT(要サービス
+      アカウント認証)で本文認識、という2段構成だった。
+  新: ウェイクワード検知・本文認識ともに speech_recognition ライブラリの
+      recognizer.recognize_google() (Google Web Speech API、APIキー不要) に
+      一本化した。Voskより認識精度が高く、反応性の問題を解消するため。
 
-設計:
-  - PyAudio インスタンスは1つを使い回す (再生成によるデバイス競合を回避)
-  - ウェイクワード検知用ストリームと録音用ストリームは
-    open/close を切り替えつつ同じ PyAudio インスタンス上で運用する
-  - ストリームclose後は asyncio.sleep でデバイス解放を待つ
-  - TTSは espeak-ng でWAV生成 -> aplay (plughw:1,0) で再生
+動作フロー:
+  1. 常時 Microphone から listen() で発話区間を自動検出 (無音検知込み)
+  2. recognize_google() でテキスト化
+  3. テキストにウェイクワードが含まれていれば「はい、なんでしょう」と応答し
+     会話モードへ。会話モード中はもう一度 listen() して本文を取得する
+  4. 取得した本文を GeminiRequest としてサーバーに送信
+
+TTSは VOICEVOX (サーバー側エンジン) を優先し、失敗時は espeak-ng にフォールバック。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import struct
 import tempfile
-import time
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
 try:
-    import pyaudio
-    import vosk
-    import numpy as np
-    _AUDIO_OK = True
+    import speech_recognition as sr
+    _SR_OK = True
 except ImportError:
-    _AUDIO_OK = False
-    log.warning("[audio] pyaudio/vosk/numpy not available — stub mode")
+    _SR_OK = False
+    log.warning("[audio] speech_recognition not available — stub mode")
+
+try:
+    import requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
+    log.warning("[tts] requests not available — VOICEVOX disabled")
 
 from shared.protocol.config import cfg
-from shared.protocol.messages import AudioStreamEnd, AudioStreamStart, MessageEnvelope
-
-HW_RATE    = 48000   # AIY Voice HAT のネイティブレート
-VOSK_RATE  = 16000   # VOSK / Gemini 送信レート
-CHANNELS   = 1
-HW_CHUNK   = 4800    # 100ms @ 48kHz
-
-
-def _downsample(pcm48: bytes) -> bytes:
-    """48kHz PCM16 -> 16kHz PCM16 (1/3間引き)"""
-    arr = np.frombuffer(pcm48, dtype=np.int16)
-    return arr[::3].copy().tobytes()
-
-
-def _rms(pcm: bytes) -> float:
-    count = len(pcm) // 2
-    if count == 0:
-        return 0.0
-    samples = struct.unpack(f"<{count}h", pcm[:count * 2])
-    return (sum(s * s for s in samples) / count) ** 0.5
-
-
-def _find_aiy_device(pa: "pyaudio.PyAudio") -> Optional[int]:
-    keywords = ["googlevoicehat", "aiy", "voicehat"]
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        name = info["name"].lower()
-        if any(k in name for k in keywords) and info["maxInputChannels"] > 0:
-            log.info("[audio] AIY device: [%d] %s", i, info["name"])
-            return i
-    log.warning("[audio] AIY device not found — using default input")
-    return None
-
-
-class WakeWordDetector:
-    def __init__(self) -> None:
-        self._rec = None
-        self._wake_words = [w.lower() for w in cfg.audio.wake_words]
-
-    def load(self) -> None:
-        if not _AUDIO_OK:
-            return
-        log.info("[wake] loading model: %s", cfg.audio.vosk_model_path)
-        model = vosk.Model(cfg.audio.vosk_model_path)
-        self._rec = vosk.KaldiRecognizer(model, VOSK_RATE)
-        log.info("[wake] ready, words=%s", self._wake_words)
-
-    def check(self, pcm16: bytes) -> bool:
-        if self._rec is None:
-            return False
-        if self._rec.AcceptWaveform(pcm16):
-            text = json.loads(self._rec.Result()).get("text", "").lower()
-            if text:
-                log.info("[wake] heard: '%s'", text)
-            if any(w in text for w in self._wake_words):
-                log.info("[wake] * DETECTED")
-                return True
-        return False
+from shared.protocol.messages import (
+    AudioStreamEnd, AudioStreamStart, MessageEnvelope, GeminiRequest,
+)
 
 
 class AudioPipeline:
     """
-    ウェイクワード検知 -> PCMストリーミング -> TTS再生 を管理する。
+    ウェイクワード検知 (Google Web Speech API) -> 本文認識 -> TTS再生 を管理する。
     """
 
     def __init__(self, connection_manager) -> None:
         self._conn = connection_manager
-        self._det  = WakeWordDetector()
         self._running = False
         self._n = 0
+        self._recognizer: Optional["sr.Recognizer"] = None
+        self._mic: Optional["sr.Microphone"] = None
+        self._wake_words = [w.lower() for w in cfg.audio.wake_words]
+        self._language = cfg.google_stt.language_code
+        self._is_speaking = asyncio.Event()  # set中はTTS再生中 (listen()を避ける)
 
     async def start(self) -> None:
         self._running = True
-        await asyncio.get_running_loop().run_in_executor(None, self._det.load)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._setup_microphone)
         asyncio.create_task(self._loop(), name="audio_listen")
         log.info("[audio_pipeline] started")
 
     async def stop(self) -> None:
         self._running = False
 
+    def _setup_microphone(self) -> None:
+        if not _SR_OK:
+            return
+        self._recognizer = sr.Recognizer()
+        # AIY Voice HAT を明示的に探す (見つからなければデフォルト入力デバイス)
+        device_index = self._find_aiy_device_index()
+        self._mic = sr.Microphone(device_index=device_index)
+        log.info("[audio] microphone ready (device_index=%s), wake_words=%s",
+                  device_index, self._wake_words)
+
+    def _find_aiy_device_index(self) -> Optional[int]:
+        keywords = ["googlevoicehat", "aiy", "voicehat"]
+        try:
+            for i, name in enumerate(sr.Microphone.list_microphone_names()):
+                if any(k in name.lower() for k in keywords):
+                    log.info("[audio] AIY device: [%d] %s", i, name)
+                    return i
+        except Exception as exc:
+            log.warning("[audio] device enumeration failed: %s", exc)
+        log.warning("[audio] AIY device not found — using default input")
+        return None
+
+    # ── 音声認識 (ブロッキング、executor経由で呼ぶ) ──────────────
+    def _listen_once(self) -> Optional["sr.AudioData"]:
+        """
+        発話区間を1つ録音して返す。タイムアウト/エラー時はNone。
+        参考実装と同様、listen()の直前に毎回 adjust_for_ambient_noise() を呼び、
+        その場の環境ノイズに追従させる。timeout/phrase_time_limitは指定せず
+        speech_recognitionのデフォルト挙動 (発話開始まで無期限待機、
+        発話終了は自然な無音検知に任せる) に委ねる。
+        """
+        if self._recognizer is None or self._mic is None:
+            return None
+        try:
+            with self._mic as source:
+                self._recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = self._recognizer.listen(source)
+            return audio
+        except Exception as exc:
+            log.error("[audio] listen error: %s", exc)
+            return None
+
+    def _recognize(self, audio: "sr.AudioData") -> str:
+        if self._recognizer is None or audio is None:
+            return ""
+        try:
+            return self._recognizer.recognize_google(audio, language=self._language)
+        except sr.UnknownValueError:
+            return ""
+        except sr.RequestError as exc:
+            log.error("[stt] google STT request error: %s", exc)
+            return ""
+
     # ── TTS ──────────────────────────────────────────────────
     async def speak(self, text: str, lang: str = "ja-JP") -> None:
+        """
+        VOICEVOX (サーバー側エンジン) でテキストを音声合成して再生する。
+        VOICEVOXが無効/接続失敗の場合は espeak-ng にフォールバックする。
+
+        再生中は is_speaking フラグを立て、マイクが自分の声を拾って
+        誤ってウェイクワード判定/本文認識をしてしまうのを防ぐ。
+        """
         log.info("[tts] '%s'", text[:50])
+        self._is_speaking.set()
+        try:
+            if cfg.voicevox.enabled and _REQUESTS_OK:
+                wav_bytes = await asyncio.get_running_loop().run_in_executor(
+                    None, self._synthesize_voicevox, text
+                )
+                if wav_bytes is not None:
+                    await self._play_wav_bytes(wav_bytes)
+                    return
+                log.warning("[tts] VOICEVOX failed — falling back to espeak-ng")
+
+            await self._speak_espeak(text, lang)
+        finally:
+            self._is_speaking.clear()
+
+    def _synthesize_voicevox(self, text: str) -> Optional[bytes]:
+        base = f"http://{cfg.voicevox.host}:{cfg.voicevox.port}"
+        speaker = cfg.voicevox.speaker_id
+        timeout = cfg.voicevox.timeout_sec
+
+        try:
+            r = requests.post(
+                f"{base}/audio_query",
+                params={"text": text, "speaker": speaker},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            audio_query = r.json()
+
+            r2 = requests.post(
+                f"{base}/synthesis",
+                params={"speaker": speaker},
+                json=audio_query,
+                timeout=timeout,
+            )
+            r2.raise_for_status()
+            return r2.content
+        except Exception as exc:
+            log.error("[tts] voicevox error: %s", exc)
+            return None
+
+    async def _play_wav_bytes(self, wav_bytes: bytes) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
+            f.write(wav_bytes)
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "aplay", "-q", "-D", "plughw:1,0", wav_path,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.wait()
+        except Exception as exc:
+            log.error("[tts] playback error: %s", exc)
+        finally:
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
+
+    async def _speak_espeak(self, text: str, lang: str = "ja-JP") -> None:
         l = "ja" if lang.startswith("ja") else "en"
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
@@ -132,12 +208,12 @@ class AudioPipeline:
             )
             await p.wait()
             p2 = await asyncio.create_subprocess_exec(
-                "aplay", "-D", "plughw:1,0", wav_path,
+                "aplay", "-q", "-D", "plughw:1,0", wav_path,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
             await p2.wait()
         except Exception as exc:
-            log.error("[tts] error: %s", exc)
+            log.error("[tts] espeak error: %s", exc)
         finally:
             try:
                 os.unlink(wav_path)
@@ -146,92 +222,63 @@ class AudioPipeline:
 
     # ── メインループ ─────────────────────────────────────────
     async def _loop(self) -> None:
-        if not _AUDIO_OK:
+        if not _SR_OK or self._recognizer is None:
             log.warning("[audio_pipeline] stub mode")
             return
 
         loop = asyncio.get_running_loop()
-        pa  = pyaudio.PyAudio()
-        dev = _find_aiy_device(pa)
+        log.info("[audio_pipeline] listening for wake word...")
 
-        def _open():
-            return pa.open(
-                format=pyaudio.paInt16, channels=CHANNELS,
-                rate=HW_RATE, input=True,
-                input_device_index=dev, frames_per_buffer=HW_CHUNK,
-            )
+        while self._running:
+            # TTS再生中はマイクが自分の声を拾ってしまうため、再生終了まで待つ
+            while self._is_speaking.is_set():
+                await asyncio.sleep(0.1)
 
-        st = _open()
-        log.info("[audio_pipeline] listening (48kHz->16kHz)...")
+            audio = await loop.run_in_executor(None, self._listen_once)
+            if audio is None:
+                continue
 
-        try:
-            while self._running:
-                pcm48 = st.read(HW_CHUNK, exception_on_overflow=False)
-                pcm16 = _downsample(pcm48)
+            text = await loop.run_in_executor(None, self._recognize, audio)
+            if not text:
+                continue
 
-                if self._det.check(pcm16):
-                    st.stop_stream()
-                    st.close()
-                    await asyncio.sleep(0.3)
+            log.info("[wake] heard: '%s'", text)
+            lowered = text.lower()
+            if any(w in lowered for w in self._wake_words):
+                log.info("[wake] * DETECTED")
+                # 自分の発声をマイクが拾わないよう、再生完了を待ってから録音を始める
+                await self.speak("はい、なんでしょう")
+                await self._handle_conversation_turn(loop)
+                log.info("[audio_pipeline] back to listening for wake word...")
 
-                    asyncio.create_task(self.speak("はい、なんでしょう"))
-                    await self._record(pa, dev, loop)
-
-                    await asyncio.sleep(0.3)
-                    st = _open()
-                    log.info("[audio_pipeline] back to listening...")
-        finally:
-            try:
-                st.stop_stream()
-                st.close()
-            except Exception:
-                pass
-            pa.terminate()
-
-    async def _record(self, pa, dev, loop) -> None:
+    async def _handle_conversation_turn(self, loop) -> None:
+        """
+        ウェイクワード検知後、1回分の本文発話を録音・認識して
+        GeminiRequest としてサーバーへ送信する。
+        """
         self._n += 1
-        sid     = f"sess_{self._n:04d}"
-        sid_int = self._n
+        sid = f"sess_{self._n:04d}"
 
         await self._conn.control.send(MessageEnvelope(payload=AudioStreamStart(session_id=sid)))
 
-        def _open_rec():
-            return pa.open(
-                format=pyaudio.paInt16, channels=CHANNELS,
-                rate=HW_RATE, input=True,
-                input_device_index=dev, frames_per_buffer=HW_CHUNK,
-            )
+        audio = await loop.run_in_executor(None, self._listen_once)
 
-        st = await loop.run_in_executor(None, _open_rec)
-        t0 = time.time()
-        total = 0
-        sil = 0
-        log.info("[stream] recording %s...", sid)
-
-        try:
-            while True:
-                pcm48 = await loop.run_in_executor(
-                    None, lambda: st.read(HW_CHUNK, exception_on_overflow=False)
-                )
-                pcm16 = _downsample(pcm48)
-                total += len(pcm16)
-
-                asyncio.create_task(self._conn.audio.send_audio(sid_int, pcm16))
-
-                rms = _rms(pcm16)
-                sil = sil + 100 if rms < cfg.audio.silence_amplitude else 0
-
-                if sil >= cfg.audio.silence_threshold_ms:
-                    log.info("[stream] silence -> end")
-                    break
-                if time.time() - t0 > 30:
-                    log.warning("[stream] timeout")
-                    break
-        finally:
-            await loop.run_in_executor(None, lambda: (st.stop_stream(), st.close()))
-
-        dur = int((time.time() - t0) * 1000)
         await self._conn.control.send(
-            MessageEnvelope(payload=AudioStreamEnd(session_id=sid, duration_ms=dur, total_bytes=total))
+            MessageEnvelope(payload=AudioStreamEnd(session_id=sid, duration_ms=0, total_bytes=0))
         )
-        log.info("[stream] done %dms/%dbytes", dur, total)
+
+        if audio is None:
+            log.info("[stt] no audio captured — skipping")
+            await self.speak("聞き取れませんでした、もう一度お願いします")
+            return
+
+        text = await loop.run_in_executor(None, self._recognize, audio)
+        if not text:
+            log.info("[stt] no speech recognized — skipping Gemini request")
+            await self.speak("聞き取れませんでした、もう一度お願いします")
+            return
+
+        log.info("[stt] recognized: '%s'", text)
+        await self._conn.control.send(
+            MessageEnvelope(payload=GeminiRequest(session_id=sid, text_input=text))
+        )
