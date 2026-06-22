@@ -199,6 +199,29 @@ class DisplayController:
 
         self._device.display(img)
 
+    async def show_log(self, lines: list[tuple[str, tuple[int,int,int]]]) -> None:
+        """
+        色付きログ行をディスプレイに描画する。
+        lines: [(text, (R,G,B)), ...] のリスト
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self._render_log, lines)
+
+    def _render_log(self, lines: list[tuple[str, tuple[int,int,int]]]) -> None:
+        if not _PIL:
+            return
+        img  = Image.new("RGB", (self.width, self.height), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13
+            )
+        except Exception:
+            font = ImageFont.load_default()
+        for i, (text, color) in enumerate(lines[:14]):
+            draw.text((2, 2 + i * 16), text, font=font, fill=color)
+        self._device.display(img)
+
     async def show_debug(self, lines: list[str]) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self._executor, self._render_debug, lines)

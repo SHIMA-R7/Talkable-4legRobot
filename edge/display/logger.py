@@ -111,37 +111,8 @@ class DisplayLogger:
 
     async def _render(self) -> None:
         lines_snapshot = list(self._lines)
-        await asyncio.get_running_loop().run_in_executor(
-            None, self._draw, lines_snapshot
-        )
-
-    def _draw(self, lines: list[tuple[str, int]]) -> None:
-        if not self._display._initialized:
-            return
-
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-        except ImportError:
-            return
-
-        img  = Image.new("RGB", (self._display.width, self._display.height), (0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13
-            )
-        except Exception:
-            font = ImageFont.load_default()
-
-        y = 2
-        line_h = 16
-
-        for text, level in lines:
-            if y + line_h > self._display.height:
-                break
-            color = _LEVEL_COLOR.get(level, (0, 200, 0))
-            draw.text((2, y), text[:CHARS_PER_LINE], font=font, fill=color)
-            y += line_h
-
-        self._display._device.display(img)
+        colored = [
+            (text[:CHARS_PER_LINE], _LEVEL_COLOR.get(level, (0, 200, 0)))
+            for text, level in lines_snapshot
+        ]
+        await self._display.show_log(colored)
