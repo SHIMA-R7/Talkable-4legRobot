@@ -24,10 +24,10 @@ import textwrap
 from collections import deque
 from typing import Optional
 
-# 表示するログの最大行数 (240px / 16px行高 = 14行)
-MAX_LINES = 14
-# 表示する最大文字数/行 (13px幅フォントで240pxに収まる目安)
-CHARS_PER_LINE = 28
+# 表示するログの最大行数 (160px / 16px行高 = 9行)
+MAX_LINES = 9
+# 表示する最大文字数/行 (128pxに収まる目安)
+CHARS_PER_LINE = 20
 
 # 表示をスキップするALSAノイズパターン
 _SKIP_PREFIXES = (

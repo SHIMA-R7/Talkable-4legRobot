@@ -71,9 +71,9 @@ servo:
 # --- SPI ディスプレイ (AIY Voice HAT流用ピン) ---
 display:
   enabled: true
-  driver: "st7789"
-  width: 240
-  height: 240
+  driver: "st7735"
+  width: 128
+  height: 160
   spi_bus: 0
   spi_device: 0
   spi_speed_hz: 40000000
