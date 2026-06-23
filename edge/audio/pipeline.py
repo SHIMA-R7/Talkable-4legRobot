@@ -63,7 +63,17 @@ class AudioPipeline:
         self._mic: Optional["sr.Microphone"] = None
         self._wake_words = [w.lower() for w in cfg.audio.wake_words]
         self._language = cfg.google_stt.language_code
-        self._is_speaking = asyncio.Event()  # set中はTTS再生中 (listen()を避ける)
+        self._is_speaking = asyncio.Event()
+        # LED状態変更コールバック (main.pyから set_led_callbacks() で登録)
+        self._on_idle: Optional[callable] = None
+        self._on_listening: Optional[callable] = None
+        self._on_thinking: Optional[callable] = None
+
+    def set_led_callbacks(self, on_idle, on_listening, on_thinking) -> None:
+        """LED状態変更コールバックを登録する"""
+        self._on_idle = on_idle
+        self._on_listening = on_listening
+        self._on_thinking = on_thinking
 
     async def start(self) -> None:
         self._running = True
@@ -246,9 +256,14 @@ class AudioPipeline:
             lowered = text.lower()
             if any(w in lowered for w in self._wake_words):
                 log.info("[wake] * DETECTED")
-                # 自分の発声をマイクが拾わないよう、再生完了を待ってから録音を始める
+                # ウェイクワード検知 → 青（会話受付中）
+                if self._on_listening:
+                    self._on_listening()
                 await self.speak("はい、なんでしょう")
                 await self._handle_conversation_turn(loop)
+                # 会話終了 → 緑（待機）
+                if self._on_idle:
+                    self._on_idle()
                 log.info("[audio_pipeline] back to listening for wake word...")
 
     async def _handle_conversation_turn(self, loop) -> None:
@@ -279,6 +294,9 @@ class AudioPipeline:
             return
 
         log.info("[stt] recognized: '%s'", text)
+        # STT完了 → Gemini処理中（黄色パルス）
+        if self._on_thinking:
+            self._on_thinking()
         await self._conn.control.send(
             MessageEnvelope(payload=GeminiRequest(session_id=sid, text_input=text))
         )

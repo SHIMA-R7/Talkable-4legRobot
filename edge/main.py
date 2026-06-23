@@ -32,6 +32,7 @@ from edge.audio.pipeline import AudioPipeline
 from edge.servo import ServoController
 from edge.display.controller import DisplayController
 from edge.display.logger import DisplayLogger
+from edge.led.controller import LedController, LedState
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +52,8 @@ EMOTION_TO_POSE = {
 
 # ── ディスパッチループ ────────────────────────────────────────
 async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
-                         servo: ServoController, executor: FunctionExecutor) -> None:
+                         servo: ServoController, executor: FunctionExecutor,
+                         led: LedController) -> None:
     log.info("[dispatch] loop started")
     while True:
         try:
@@ -68,14 +70,13 @@ async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
             log.info("[dispatch] GEMINI_RESPONSE: emotion=%s text=%s",
                      msg.emotion, (msg.text or "")[:80])
 
-            # Geminiが execute_pose/set_emotion を呼ばなかった場合のフォールバック。
-            # 既にFunction Call経由でポーズ実行済みでも、同じポーズへの再実行は
-            # 安全 (アイドル時の状態確定として機能する) なため許容する。
             pose = EMOTION_TO_POSE.get(msg.emotion.value, "neutral")
             asyncio.create_task(servo.execute_pose(pose))
 
             if msg.text:
-                asyncio.create_task(audio.speak(msg.text))
+                led.set_state(LedState.SPEAKING)
+                await audio.speak(msg.text)
+                led.set_state(LedState.IDLE)
 
         elif mtype == MessageType.FUNCTION_CALL:
             log.info("[dispatch] FUNCTION_CALL: %s(%s) call_id=%s",
@@ -93,6 +94,7 @@ async def dispatch_loop(conn: ConnectionManager, audio: AudioPipeline,
 
         elif mtype == MessageType.ERROR:
             log.warning("[dispatch] server error [%s]: %s", msg.code, msg.message)
+            led.set_state(LedState.ERROR)
 
         else:
             log.debug("[dispatch] unhandled: %s", mtype)
@@ -142,6 +144,11 @@ async def main() -> None:
     servo = ServoController()
     executor = FunctionExecutor(servo, audio)
 
+    # LED初期化（起動中は赤点滅）
+    led = LedController()
+    await asyncio.get_running_loop().run_in_executor(None, led.init)
+    led.set_state(LedState.BOOT)
+
     # ディスプレイ初期化 + ログ表示
     display = DisplayController(
         driver=cfg.display.driver,
@@ -150,7 +157,7 @@ async def main() -> None:
     )
     await display.init()
     disp_logger = DisplayLogger(display)
-    disp_logger.install()  # 以後のloggingが自動的にディスプレイに流れる
+    disp_logger.install()
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -174,10 +181,21 @@ async def main() -> None:
 
     # 音声パイプライン起動
     await audio.start()
+    # パイプラインにLED状態コールバックを登録
+    audio.set_led_callbacks(
+        on_idle=lambda: led.set_state(LedState.IDLE),
+        on_listening=lambda: led.set_state(LedState.LISTENING),
+        on_thinking=lambda: led.set_state(LedState.THINKING),
+    )
+
+    # 起動完了 → 起動宣言を発声 → 緑点滅（待機）へ
+    led.set_state(LedState.SPEAKING)
+    await audio.speak(f"{cfg.system.name}、起動完了しました。")
+    led.set_state(LedState.IDLE)
 
     tasks = [
-        asyncio.create_task(dispatch_loop(conn, audio, servo, executor), name="dispatch"),
-        asyncio.create_task(status_loop(conn),                          name="status"),
+        asyncio.create_task(dispatch_loop(conn, audio, servo, executor, led), name="dispatch"),
+        asyncio.create_task(status_loop(conn), name="status"),
     ]
 
     await stop_event.wait()
@@ -187,6 +205,7 @@ async def main() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
     await audio.stop()
     await servo.shutdown()
+    led.shutdown()
     await conn.stop()
     await display.shutdown()
     log.info("=== edge shutdown complete ===")
